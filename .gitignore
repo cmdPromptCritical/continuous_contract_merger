@@ -1,0 +1,4 @@
+checkpoint.json
+.env
+questdb.env
+candlestick_charts/
