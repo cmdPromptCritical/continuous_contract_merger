@@ -178,11 +178,14 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
     df_processed = df_processed.with_columns(
         pl.col('time').cast(pl.Int64).alias('time')
     )
+
     # Convert to Pandas for QuestDB ingestion
     df_pandas = df_processed.to_pandas()
-    
+
     # Ensure the timestamp column is properly formatted for QuestDB
-    df_pandas['time'] = pd.to_datetime(df_pandas['time'], utc=True)
+    df_pandas['time'] = pd.to_datetime(df_pandas['time'], utc=True, unit='us')
+    print(df_pandas.head())
+    #time.sleep(100000)  # Allow time for the print to flush before proceeding
     
     print(f"Preparing to load {len(df_pandas)} records to QuestDB")
 
