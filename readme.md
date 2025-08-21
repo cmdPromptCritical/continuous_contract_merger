@@ -2,10 +2,6 @@
 
 This repository contains Python scripts for managing and processing futures contract data, specifically for creating continuous contract data from individual contract files.
 
-## Purpose
-
-The main goal of this project is to take separate tick data files from a futures contract series and merge them into one continuous contract. This is essential for historical analysis and backtesting trading strategies.
-
 ## Scripts
 
 ### `scid_to_qdb.py`
@@ -24,17 +20,101 @@ This script reads futures data from Sierra Chart `.scid` files and inserts it in
 
 This script is similar to `scid_to_qdb.py` but is designed to work with a PostgreSQL database instead of QuestDB. It reads data from `.scid` files and loads it into a PostgreSQL table.
 
-### `dedupcontract.py`
+### `lib/compute_front_contract_questdb.py`
 
-This script is intended to handle the deduplication of contract data, which is a crucial step in creating a clean, continuous contract series. (Note: The implementation details of this script are not fully elaborated in the provided file.)
+This script identifies the front contract for each day and updates the `front_contract` flag in the `trades` table.
+
+### `lib/create_materialized_views_qdb.py`
+
+This script creates a materialized view in QuestDB to aggregate the trade data into OHLC (Open, High, Low, Close) format for a specified time interval (e.g., 15 seconds).
 
 ## Workflow
 
-1.  **Data Extraction:** Use `scid_to_qdb.py` or `scid_to_pg.py` to extract data from individual `.scid` contract files.
-2.  **Database Storage:** The extracted data is stored in either a QuestDB or PostgreSQL database.
-3.  **Deduplication:** The `dedupcontract.py` script can be used to process the data in the database to remove duplicate entries, which can occur around contract rollover periods.
+The process of creating a continuous contract from individual `.scid` files involves the following steps:
 
-## TODO
+### 1. Uploading Data to QuestDB
 
--   Flesh out the implementation of `dedupcontract.py` to perform the following:
-    -   Drop days where the trading volume is significantly lower than the recent median volume (e.g., 15% of the 100-day median). This helps to filter out periods of low liquidity, such as the beginning of a new contract or Sundays.
+The first step is to upload the raw futures data from the `.scid` files into a QuestDB database. This is done using the `scid_to_qdb.py` script.
+
+1.  **Prerequisites:**
+    *   Ensure you have a running instance of QuestDB.
+    *   Create a `qdb.env` file with the necessary database connection details (see `.env.example`).
+
+2.  **Table Schema:**
+    The script assumes the following table schema in QuestDB. If the table does not exist, it will be created automatically.
+
+    ```sql
+    CREATE TABLE trades (
+        time TIMESTAMP,
+        open DOUBLE,
+        high DOUBLE,
+        low DOUBLE,
+        close DOUBLE,
+        volume INT,
+        number_of_trades INT,
+        bid_volume INT,
+        ask_volume INT,
+        symbol SYMBOL,
+        symbol_period SYMBOL,
+        front_contract BOOLEAN
+    ) TIMESTAMP(time)
+    PARTITION BY DAY WAL
+    DEDUP UPSERT KEYS(time, symbol, symbol_period);
+    ```
+
+3.  **Execution:**
+    Run the `scid_to_qdb.py` script, specifying the path to the `.scid` file. The script will process the file and upload the data to the `trades` table in QuestDB.
+
+    ```bash
+    python scid_to_qdb.py
+    ```
+
+    The script will continuously monitor the `.scid` file for new data and update the database accordingly.
+
+### 2. Identifying the Front Contract
+
+Once the data is in QuestDB, the next step is to identify the front contract for each day. The front contract is typically the contract with the highest trading volume for a given day.
+
+1.  **Execution:**
+    Run the `compute_front_contract_questdb.py` script.
+
+    ```bash
+    python lib/compute_front_contract_questdb.py
+    ```
+
+    This script will iterate through the data, and for each day, it will identify the `symbol_period` with the highest volume and set the `front_contract` flag to `TRUE` for that contract and `FALSE` for all others.
+
+### 3. Creating Materialized Views
+
+To facilitate analysis, you can create materialized views that aggregate the raw trade data into OHLC format.
+
+1.  **Execution:**
+    The `lib/create_materialized_views_qdb.py` script contains the SQL query to create a materialized view. You can execute this script to create a view named `trades_ohlc_15s` that aggregates the data into 15-second bars.
+
+    ```sql
+    CREATE MATERIALIZED VIEW IF NOT EXISTS trades_ohlc_15s
+    WITH BASE 'trades' REFRESH IMMEDIATE AS (
+        SELECT
+            time,
+            symbol,
+            symbol_period,
+            first(open) AS open,
+            max(high) AS high,
+            min(low) AS low,
+            last(close) AS close,
+            sum(volume) AS volume,
+            sum(number_of_trades) AS number_of_trades,
+            sum(bid_volume) AS bid_volume,
+            sum(ask_volume) AS ask_volume,
+            front_contract
+        FROM trades
+        SAMPLE BY 15s
+    ) PARTITION BY DAY;
+    ```
+
+    You can run the script using:
+    ```bash
+    python lib/qdb_create_materialized_views.py
+    ```
+
+    This will create the materialized view in QuestDB, which can then be queried for aggregated OHLC data.

@@ -331,7 +331,7 @@ if __name__ == "__main__":
     import pandas as pd
     
     table_name = "trades"  # QuestDB table name
-    scid_file = r"C:\auxDrive\SierraChart2\Data\ESH5.CME.scid"  # Set the file path to your SCID file.
+    scid_file = r"C:\auxDrive\SierraChart2\Data\ESM5.CME.scid"  # Set the file path to your SCID file.
 
     # Continuously update data from SCID file every 'x' seconds
     while True:
