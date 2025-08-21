@@ -12,6 +12,7 @@
 ##     ask_volume INT,
 ##     symbol SYMBOL CAPACITY 256,
 ##     symbol_period SYMBOL CAPACITY 256
+##     front_contract BOOLEAN, -- to mark the front contract. set to False for all historical data and another process will set it to True for the current front contract
 ## ) TIMESTAMP(time)
 ## PARTITION BY DAY WAL
 ## DEDUP UPSERT KEYS(time, symbol, symbol_period);
@@ -31,8 +32,12 @@ from concurrent.futures import ThreadPoolExecutor
 from questdb.ingress import Sender, IngressError, TimestampNanos
 import psycopg2
 
+class WorkerFailureException(Exception):
+    """Exception raised when one or more workers fail during batch processing"""
+    pass
+
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv('qdb.env')
 
 def create_table_if_not_exists(table_name, questdb_host, questdb_pg_port, user, password):
     """Create a table in QuestDB if it does not already exist."""
@@ -52,7 +57,8 @@ def create_table_if_not_exists(table_name, questdb_host, questdb_pg_port, user, 
                     bid_volume INT,
                     ask_volume INT,
                     symbol SYMBOL CAPACITY 256,
-                    symbol_period SYMBOL CAPACITY 256
+                    symbol_period SYMBOL CAPACITY 256,
+                    front_contract BOOLEAN
                 ) TIMESTAMP(time)
                 PARTITION BY DAY WAL
                 DEDUP UPSERT KEYS(time, symbol, symbol_period);
@@ -94,17 +100,21 @@ def get_scid_np(scidFile, offset=0):
 
     return scid_as_np_array, new_position
 
-def send_batch(conf_str, table_name, batches, timestamp_name):
+def send_batch(conf_str, table_name, batches, timestamp_name, df_pandas):
     """Process batches of data and send to QuestDB"""
     try:
         with Sender.from_conf(conf_str, auto_flush=False, init_buf_size=100_000_000) as qdb_sender:
             batch_count = 0
+            failed = False
             while True:
                 try:
-                    batch_df = batches.pop()
+                    start_idx, end_idx = batches.pop()
                     batch_count += 1
-                    print(f"Processing batch {batch_count} with {len(batch_df)} rows")
-                    
+                    print(f"Processing batch {batch_count} with {end_idx - start_idx} rows")
+
+                    # Only create the batch DataFrame when needed
+                    batch_df = df_pandas.iloc[start_idx:end_idx].copy()
+
                     # Send the batch to QuestDB
                     qdb_sender.dataframe(
                         batch_df,
@@ -114,22 +124,30 @@ def send_batch(conf_str, table_name, batches, timestamp_name):
                     )
                     qdb_sender.flush()
                     print(f"Successfully sent batch {batch_count}")
-                    
+
+                    # Explicitly delete the batch to free memory
+                    del batch_df
+
                 except IndexError:
                     # No more batches to process
                     break
                 except Exception as e:
                     print(f"Error processing batch {batch_count}: {e}")
+                    failed = True
                     # Re-add the batch to the queue for retry (optional)
-                    # batches.append(batch_df)
+                    # batches.append((start_idx, end_idx))
                     break
-            
+
             print(f"Thread completed. Processed {batch_count} batches.")
-                    
+            if failed:
+                raise Exception("One or more batches failed to process")
+
     except IngressError as e:
         print(f"QuestDB ingestion error: {e}")
+        raise  # Re-raise to propagate the error
     except Exception as e:
         print(f"Unexpected error in send_batch: {e}")
+        raise  # Re-raise to propagate the error
 
 def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='localhost', questdb_port=9009):
     """Load data into QuestDB using parallel batch processing"""
@@ -149,10 +167,11 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
         pl.col('bidvolume').alias('bid_volume').cast(pl.Int32),
         pl.col('askvolume').alias('ask_volume').cast(pl.Int32),
         pl.lit(symbol).alias('symbol'),
-        pl.lit(symbol_period).alias('symbol_period')
+        pl.lit(symbol_period).alias('symbol_period'),
+        pl.lit(False).alias('front_contract')  # Add front_contract column, all False
     ]).select([
         'time', 'open', 'high', 'low', 'close',
-        'volume', 'number_of_trades', 'bid_volume', 'ask_volume', 'symbol', 'symbol_period'
+        'volume', 'number_of_trades', 'bid_volume', 'ask_volume', 'symbol', 'symbol_period', 'front_contract'
     ])
 
     # convert time column to int64 for QuestDB
@@ -167,19 +186,22 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
     
     print(f"Preparing to load {len(df_pandas)} records to QuestDB")
 
-    # Create batches for parallel processing
+    # Create batches using indices instead of copying data
     batches = deque()
     batch_size = int(os.getenv("BATCH_SIZE", "200000"))  # Default 100k records per batch. Set to 1M for high performance
     parallel_workers = int(os.getenv("PARALLEL_WORKERS", "8"))  # Default 8 parallel connections
-    
-    # Split dataframe into batches
-    total_batches = len(df_pandas) // batch_size + (1 if len(df_pandas) % batch_size > 0 else 0)
-    print(f"Splitting data into {total_batches} batches of {batch_size} records each")
-    
-    for i, batch in enumerate(np.array_split(df_pandas, total_batches)):
-        if len(batch) > 0:  # Only add non-empty batches
-            batches.append(batch)
-            print(f"Created batch {i+1} with {len(batch)} records")
+
+    # Calculate batch indices instead of splitting the DataFrame
+    total_rows = len(df_pandas)
+    total_batches = total_rows // batch_size + (1 if total_rows % batch_size > 0 else 0)
+    print(f"Splitting data into {total_batches} batches of up to {batch_size} records each")
+
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, total_rows)
+        if start_idx < end_idx:  # Only add non-empty batches
+            batches.append((start_idx, end_idx))
+            print(f"Created batch {i+1} with {end_idx - start_idx} records")
 
     # QuestDB connection configuration
     conf_str = f'http::addr={questdb_host}:{questdb_port};'
@@ -187,22 +209,28 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
 
     print(f"Starting parallel ingestion with {parallel_workers} workers")
     start_time = time.time()
-    
+
     # Use ThreadPoolExecutor for parallel batch processing
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         futures = []
         for i in range(parallel_workers):
-            future = executor.submit(send_batch, conf_str, table_name, batches, timestamp_name)
+            future = executor.submit(send_batch, conf_str, table_name, batches, timestamp_name, df_pandas)
             futures.append(future)
             print(f"Started worker {i+1}")
         
         # Wait for all workers to complete
+        worker_failed = False
         for i, future in enumerate(futures):
             try:
                 future.result()
                 print(f"Worker {i+1} completed successfully")
             except Exception as e:
                 print(f"Worker {i+1} failed with error: {e}")
+                worker_failed = True
+
+        # If any worker failed, raise an exception to stop the process
+        if worker_failed:
+            raise WorkerFailureException("One or more workers failed during batch processing")
 
     end_time = time.time()
     print(f"Batch processing completed in {end_time - start_time:.2f} seconds")
@@ -217,10 +245,10 @@ def main(table_name, scid_file):
     start_time = time.time()
     
     # Get QuestDB connection details from environment variables for table creation
-    questdb_host = os.getenv("QUESTDB_HOST", "localhost")
-    questdb_pg_port = int(os.getenv("QUESTDB_PG_PORT", "8812"))  # Standard PG port for QuestDB
-    questdb_user = os.getenv("QUESTDB_USER", "admin")
-    questdb_password = os.getenv("QUESTDB_PASSWORD", "quest")
+    questdb_host = os.getenv("DB_HOST", "localhost")
+    questdb_pg_port = int(os.getenv("QUESTDB_PG_PORT", "8812"))  # Standard PG port for QuestDB, needed for create if not exist function
+    questdb_user = os.getenv("DB_USER", "admin")
+    questdb_password = os.getenv("DB_PASSWORD", "quest")
 
     # Create table if it doesn't exist
     create_table_if_not_exists(table_name, questdb_host, questdb_pg_port, questdb_user, questdb_password)
@@ -272,8 +300,8 @@ def main(table_name, scid_file):
         df_raw = pl.DataFrame(intermediate_np_array)
         
         # Get QuestDB connection details from environment variables
-        questdb_host = os.getenv("QUESTDB_HOST", "localhost")
-        questdb_port = int(os.getenv("QUESTDB_PORT", "9000"))
+        questdb_host = os.getenv("DB_HOST", "localhost")
+        questdb_port = int(os.getenv("DB_PORT", "9000"))
         
         load_data_to_questdb(df_raw, table_name, symbol, symbol_period, questdb_host, questdb_port)
         
@@ -300,7 +328,7 @@ if __name__ == "__main__":
     import pandas as pd
     
     table_name = "trades"  # QuestDB table name
-    scid_file = r"C:\auxDrive\SierraChart2\Data\ESZ4.CME.scid"  # Set the file path to your SCID file.
+    scid_file = r"C:\auxDrive\SierraChart2\Data\ESH5.CME.scid"  # Set the file path to your SCID file.
 
     # Continuously update data from SCID file every 'x' seconds
     while True:
@@ -311,6 +339,10 @@ if __name__ == "__main__":
             time.sleep(sleep_duration)
         except KeyboardInterrupt:
             print("Process interrupted by user")
+            break
+        except WorkerFailureException as e:
+            print(f"Worker failure detected: {e}")
+            print("Exiting due to worker failure...")
             break
         except Exception as e:
             print(f"Unexpected error: {e}")
