@@ -1,0 +1,6 @@
+polars
+numpy
+python-dotenv
+questdb
+psycopg2-binary
+pandas
